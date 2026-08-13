@@ -1,0 +1,578 @@
+close all; clear all; clc;
+
+addpath('Auxiliary/');
+
+sim.step_time = 100e-3;
+sim.duration  = 26;
+sim.steps     = floor(sim.duration/sim.step_time);
+sim.k         = 1;
+sim.t         = 0;
+
+p_x    = -2.0;
+p_y    =  1.0;
+v_x    = 0;
+v_y    = 0;
+theta  = 0;
+omega  = 0;
+u1     = 9.8;
+du1    = 0;
+x      = [p_x; p_y; v_x; v_y; theta; omega; u1; du1];
+x_info = model_info(x);
+ctrl   = controller(x_info, sim.t);
+
+x_2      = x;
+x_info_2 = model_info(x_2);
+ctrl_2   = controller2(x_info_2, sim.t);
+
+H  = graphic([], x_info, ctrl, sim);
+H2 = graphic2([], x_info_2, ctrl_2, sim);
+
+for k = 1:sim.steps
+    sim.k = k;
+    sim.t = sim.k * sim.step_time;
+
+    ctrl   = controller(x_info, sim.t);
+    ctrl_2 = controller2(x_info_2, sim.t);
+
+
+    [~, x_ode] = ode15s(@(t, x)VTOL_close_loop(x, t),   sim.t+[0, sim.step_time], x);
+    [~, x_ode_2]= ode15s(@(t, x)VTOL_close_loop2(x, t), sim.t+[0, sim.step_time], x_2);
+
+    x      = x_ode(end, :)';
+    x_info = model_info(x);
+
+    x_2      = x_ode_2(end, :)';
+    x_info_2 = model_info(x_2);
+
+    H  = graphic(H, x_info, ctrl, sim);
+    H2 = graphic2(H2, x_info_2, ctrl_2, sim);
+    drawnow limitrate;
+    k/ sim.steps
+end
+
+
+function dx = VTOL_close_loop(x, t)
+x_info = model_info(x);
+ctrl   = controller(x_info, t);
+dx     = VTOL_dynamics(x, ctrl);
+end
+
+function dx = VTOL_close_loop2(x, t)
+x_info = model_info(x);
+ctrl   = controller2(x_info, t);
+dx     = VTOL_dynamics(x, ctrl);
+end
+
+function ctrl = controller(x_info, t)
+persistent opt;
+if(isempty(opt))
+    opt = optimoptions('quadprog', 'Display', 'off');
+end
+
+ctrl.obs_cell{1,1} = [-2.2, 1.5; ...
+                       1.5, 2.0];
+ctrl.obs_cell{1,2} = [-2.2, 2.5; ...
+                       0.5, 0.5];
+ctrl.r      = [0.35; 0.35];
+ctrl.margin = 0.05;
+
+p = [x_info.p_x; x_info.p_y];
+ctrl.x2_nominal = [0.6; 1.0];
+
+[ctrl.h1, ctrl.dh1_dpT] = line_segment(p, ctrl.obs_cell{1,1}(:, 1), ctrl.obs_cell{1,1}(:, 2), ctrl.r(1));
+[ctrl.h2, ctrl.dh2_dpT] = line_segment(p, ctrl.obs_cell{1,2}(:, 1), ctrl.obs_cell{1,2}(:, 2), ctrl.r(2));
+
+ctrl.h3 = 2.5 + x_info.p_x; ctrl.dh3_dpT = [-1, 0];
+ctrl.h4 = 2.5 - x_info.p_x; ctrl.dh4_dpT = [ 1, 0];
+ctrl.h5 = 2.8 - x_info.p_y; ctrl.dh5_dpT = [ 0, 1];
+
+
+ctrl.A = [-ctrl.dh1_dpT/norm(ctrl.dh1_dpT); -ctrl.dh2_dpT/norm(ctrl.dh2_dpT)];
+ctrl.b = 1.0*[ctrl.h1; ctrl.h2];
+
+ctrl.A_L = get_positive_basis(11);
+[ctrl.b_L, ctrl.u_L] = reshape_b_L(ctrl.A_L, ctrl.A, 0, ctrl.b);
+    function A = get_positive_basis(N)
+        theta = linspace(0, 2*pi, N+1)';
+        A     = [cos(theta(1:end-1)), sin(theta(1:end-1))];
+    end
+
+    function [b_L, rho_s]= reshape_b_L(A_L, A_c, c_c, b_c)
+        n_l = size(A_L, 1);
+        [b_min, idx] = min(b_c);
+
+        if(b_min <= 0)
+            rho_s = A_c(idx, :)'*b_min / (1-c_c);
+        else
+            rho_s = [0; 0];
+        end
+
+        c_A    = cos(2*pi/n_l);
+        k_phi  = 1.0;
+        c_A_c  = cos(acos(sqrt(1-c_c^2)) + acos(c_A));
+
+        phi_1 = max(A_L*A_c', c_A_c) .* ((b_c-A_c*rho_s-c_c*norm(rho_s))/(1+c_c))';
+        phi_2 = k_phi*max(c_A_c - A_L*A_c', 0);
+        phi   = A_L*rho_s + min(phi_1 + phi_2, [], 2);
+        b_L   = phi;
+    end
+
+[ctrl.x2_ref, fval, exitflag, output, lambda] = quadprog(eye(2), ...
+    -ctrl.x2_nominal, ctrl.A_L, ctrl.b_L, [], [], [], [], zeros(2,1), opt);
+
+    if(exitflag == -2)
+        fprintf('This QP problem is infeasible at t=%f \n', t);
+    end
+    function [h, dh_dpT] = line_segment(p, o1, o2, r)
+        d1 = norm(p-o1);
+        d2 = norm(p-o2);
+        d3  = norm(o1-o2);
+        h  = 0;
+        dh_dp = zeros(size(p'));
+
+        if((p-o1)'*(o2-o1) <= 0)
+            h      = d1-r;
+            dh_dpT = (p-o1)'/norm(p-o1);
+        elseif((p-o2)'*(o2-o1) >= 0)
+            h      = d2-r;
+            dh_dpT = (p-o2)'/norm(p-o2);
+        else
+            d_mean = (d1+d2+d3) / 2;
+            S_p    = sqrt(d_mean*(d_mean-d1)*(d_mean-d2)*(d_mean-d3));
+            h      = 2*S_p/d3 - r;
+
+
+            dh_dpT = (d1^2-d2^2)/(4*S_p*d3)*(o1-o2)' ...
+                   + d3/(4*S_p)*(2*p-o1-o2)';
+
+        end
+    end
+ctrl.tilde_x2   = x_info.x2 - ctrl.x2_ref;
+ctrl.x3_ref     = varrho2(ctrl.tilde_x2);
+    function x3_ref = varrho2(tilde_x2)
+        x3_ref = -tilde_x2/norm(tilde_x2)*kappa2(norm(tilde_x2));
+        function y = kappa2(s)
+            y   = 11.78*s;
+        end
+    end
+
+ctrl.tilde_x3 = x_info.x3 - ctrl.x3_ref;
+ctrl.x4_ref   = varrho3(ctrl.tilde_x3);
+    function x4_ref = varrho3(tilde_x3)
+        x4_ref = -tilde_x3/norm(tilde_x3)*kappa3(norm(tilde_x3));
+        function y = kappa3(s)
+            y   = 24.69*s;
+        end
+    end
+
+ctrl.tilde_x4 = x_info.x4 - ctrl.x4_ref;
+ctrl.x5_ref = varrho4(ctrl.tilde_x4);
+    function x5_ref = varrho4(tilde_x4)
+        x5_ref = -tilde_x4/norm(tilde_x4)*kappa4(norm(tilde_x4));
+        function y = kappa4(s)
+            y   = 660.08*s;
+        end
+    end
+
+ctrl.ddu1 = x_info.omega^2 * x_info.u1 ...
+            - sin(x_info.theta)*ctrl.x5_ref(1) ...
+            + cos(x_info.theta)*ctrl.x5_ref(2);
+ctrl.u2   = -2 * x_info.omega * x_info.du1/x_info.u1 ...
+            -cos(x_info.theta) / x_info.u1*ctrl.x5_ref(1) ...
+            -sin(x_info.theta) / x_info.u1*ctrl.x5_ref(2);
+ctrl.u1   = x_info.u1;
+end
+
+function res = gamma_inv_xtilde(s, k_gamma_i, c_i)
+epsilon = 0.01;
+res = k_gamma_i*s;
+if(abs(res) > c_i)
+    res = sgn(s)*(c_i+epsilon-epsilon/(k_gamma_i*abs(s)-c_i+1));
+end
+end
+
+function ctrl = controller2(x_info, t)
+persistent opt;
+if(isempty(opt))
+    opt = optimoptions('quadprog', 'Display', 'off');
+end
+
+ctrl.obs_cell{1,1} = [-2.2, 1.5; ...
+                       1.5, 2.0];
+ctrl.obs_cell{1,2} = [-2.2, 2.5; ...
+                       0.5, 0.5];
+ctrl.r      = [0.35; 0.35];
+ctrl.margin = 0.05;
+
+p = [x_info.p_x; x_info.p_y];
+ctrl.x2_nominal = [0.6; 1.0];
+
+[ctrl.h1, ctrl.dh1_dpT] = line_segment(p, ctrl.obs_cell{1,1}(:, 1), ctrl.obs_cell{1,1}(:, 2), ctrl.r(1));
+[ctrl.h2, ctrl.dh2_dpT] = line_segment(p, ctrl.obs_cell{1,2}(:, 1), ctrl.obs_cell{1,2}(:, 2), ctrl.r(2));
+
+ctrl.h3 = 2.5 + x_info.p_x; ctrl.dh3_dpT = [-1, 0];
+ctrl.h4 = 2.5 - x_info.p_x; ctrl.dh4_dpT = [ 1, 0];
+ctrl.h5 = 2.8 - x_info.p_y; ctrl.dh5_dpT = [ 0, 1];
+
+
+ctrl.A = [-ctrl.dh1_dpT/norm(ctrl.dh1_dpT); -ctrl.dh2_dpT/norm(ctrl.dh2_dpT)];
+ctrl.b = 1.0*[ctrl.h1; ctrl.h2];
+ctrl.A_L = get_positive_basis(11);
+[ctrl.b_L, ctrl.u_L] = reshape_b_L(ctrl.A_L, ctrl.A, 0, ctrl.b);
+    function A = get_positive_basis(N)
+        theta = linspace(0, 2*pi, N+1)';
+        A     = [cos(theta(1:end-1)), sin(theta(1:end-1))];
+    end
+    function [b_L, u_L]= reshape_b_L(A_L, A, c, b)
+        n_l = size(A_L, 1);
+        [b_min, idx] = min(b);
+
+        if(b_min <= 0)
+            u_L = A(idx, :)'*b_min / (1-c);
+        else
+            u_L = [0; 0];
+        end
+
+        c_A    = cos(2*pi/n_l);
+        k_phi  = 1.0;
+        c_A_c  = cos(acos(sqrt(1-c^2)) + acos(c_A));
+
+        phi_1 = max(A_L*A', c_A_c) .* ((b-A*u_L-c*norm(u_L))/(1+c))';
+        phi_2 = k_phi*max(c_A_c - A_L*A', 0);
+        phi   = min(phi_1 + phi_2, [], 2);
+        b_L   = A_L*u_L + phi;
+    end
+
+[ctrl.x2_ref, fval, exitflag, output, lambda] = quadprog(eye(2), ...
+    -ctrl.x2_nominal, ctrl.A_L, ctrl.b_L, [], [], [], [], zeros(2,1), opt);
+
+    if(exitflag == -2)
+        fprintf('This QP problem is infeasible at t=%f \n', t);
+    end
+    function [h, dh_dpT] = line_segment(p, o1, o2, r)
+        d1 = norm(p-o1);
+        d2 = norm(p-o2);
+        d  = norm(o1-o2);
+        h  = 0;
+        dh_dp = zeros(size(p'));
+
+        if((p-o1)'*(o2-o1) <= 0)
+            h      = d1-r;
+            dh_dpT = (p-o1)'/norm(p-o1);
+        elseif((p-o2)'*(o2-o1) >= 0)
+            h      = d2-r;
+            dh_dpT = (p-o2)'/norm(p-o2);
+        else
+            d_mean = (d1+d2+d) / 2;
+            S_p    = sqrt(d_mean*(d_mean-d1)*(d_mean-d2)*(d_mean-d));
+            h      = 2*S_p/d - r;
+            dh_dpT = d1*(-d1^2+d2^2+d^2)/(4*S_p*d)*(p-o1)'/norm(p-o1) ...
+                   + d2*( d1^2-d2^2+d^2)/(4*S_p*d)*(p-o2)'/norm(p-o2);
+        end
+    end
+
+ctrl.tilde_x2   = x_info.x2 - ctrl.x2_ref;
+ctrl.x3_ref     = varrho2(ctrl.tilde_x2);
+    function x3_ref = varrho2(tilde_x2)
+        x3_ref = -tilde_x2/norm(tilde_x2)*kappa2(norm(tilde_x2));
+        function y = kappa2(s)
+            y = 11.78*s;
+        end
+    end
+
+ctrl.tilde_x3 = x_info.x3 - ctrl.x3_ref;
+ctrl.x4_ref   = varrho3(ctrl.tilde_x3);
+    function x4_ref = varrho3(tilde_x3)
+        x4_ref = -tilde_x3/norm(tilde_x3)*kappa3(norm(tilde_x3));
+        function y = kappa3(s)
+            y = 11.78*s;
+        end
+    end
+
+ctrl.tilde_x4 = x_info.x4 - ctrl.x4_ref;
+ctrl.x5_ref = varrho4(ctrl.tilde_x4);
+    function x5_ref = varrho4(tilde_x4)
+        x5_ref = -tilde_x4/norm(tilde_x4)*kappa4(norm(tilde_x4));
+        function y = kappa4(s)
+            y = 11.78*s;
+        end
+    end
+
+ctrl.ddu1 = x_info.omega^2 * x_info.u1 ...
+            - sin(x_info.theta)*ctrl.x5_ref(1) ...
+            + cos(x_info.theta)*ctrl.x5_ref(2);
+ctrl.u2   = -2 * x_info.omega * x_info.du1/x_info.u1 ...
+            -cos(x_info.theta) / x_info.u1*ctrl.x5_ref(1) ...
+            -sin(x_info.theta) / x_info.u1*ctrl.x5_ref(2);
+ctrl.u1   = x_info.u1;
+end
+
+function x_info = model_info(x)
+x_info.epsilon = 0e-3;
+x_info.g       = 9.8;
+x_info.p_x     = x(1);
+x_info.p_y     = x(2);
+x_info.v_x     = x(3);
+x_info.v_y     = x(4);
+x_info.theta   = x(5);
+x_info.omega   = x(6);
+x_info.u1      = x(7);
+x_info.du1     = x(8);
+
+x_info.x2 = [x_info.v_x; x_info.v_y];
+
+x_info.x3 = [-sin(x_info.theta)*x_info.u1; ...
+              cos(x_info.theta)*x_info.u1 - x_info.g];
+x_info.x4 = [-sin(x_info.theta)*x_info.du1 - x_info.u1*x_info.omega*cos(x_info.theta); ...
+              cos(x_info.theta)*x_info.du1 - x_info.u1*x_info.omega*sin(x_info.theta)];
+end
+
+function dx = VTOL_dynamics(x, ctrl)
+epsilon = 0e-3;
+g       = 9.8;
+
+p_x   = x(1);
+p_y   = x(2);
+v_x   = x(3);
+v_y   = x(4);
+theta = x(5);
+omega = x(6);
+u1    = x(7);
+du1   = x(8);
+ddu1  = ctrl.ddu1;
+u2    = ctrl.u2;
+
+dx  = v_x;
+dy  = v_y;
+ddx = -sin(theta)*u1 + epsilon*cos(theta)*u2;
+ddy =  cos(theta)*u1 + epsilon*sin(theta)*u2 - g;
+dtheta  = omega;
+ddtheta = u2;
+dx = [dx; dy; ddx; ddy; dtheta; ddtheta; du1; ddu1];
+end
+
+
+function H = graphic(H, x_info, ctrl, sim)
+x_vtol = x_info.p_x;
+y_vtol = x_info.p_y;
+z_vtol = 0;
+theta  = x_info.theta;
+pitch  = min(max(ctrl.u1*cos(theta) - x_info.g, -pi/100), pi/100);
+yaw    = 0;
+if(isempty(H))
+    figure(1);
+    hold on; axis equal; view(90, 0); grid on; box on;
+    axis([-4.5, 4.5, -4.5, 4.5,-0.1, 3.4])
+    setAxesFull(gcf, 0.05, 0.01, 0.2, 0.01, 0.0)
+    xlabel('Z');
+    ylabel('$[x_1]_1$', 'Interpreter', 'latex');
+    zlabel('$[x_1]_2$', 'Interpreter', 'latex');
+    set(gcf, 'position', [100, 100, 800, 350], 'color', 'w');
+    set(gca, 'fontsize', 16);
+
+    H.vtol      = vtol_show(x_vtol, y_vtol, z_vtol, theta, pitch, yaw, []);
+    H.vtol_traj = animatedline('Color', 'k', 'DisplayName', 'Fine-Tuned Controller', 'LineWidth', 2.0);
+    legend('Location', 'northwest', 'Interpreter','latex');
+    H.obstacles_real = obstacle_show_2D_hatchfill([], ctrl.obs_cell, ctrl.r, [0.8, 0.8, 0.8], -0.1, 1.0);
+
+    figure(2);
+    hold on; axis equal; grid on; box on;
+    xlabel('$[x_2]_1$', 'Interpreter', 'latex');
+    ylabel('$[x_2]_2$', 'Interpreter', 'latex');
+    set(gcf, 'position', [900, 100, 450, 450], 'color', 'w');
+    set(gca, 'fontsize', 16, 'XAxisLocation', 'origin', 'YAxisLocation', 'origin');
+    H.fig2_axis_range     = [-2, 2, -2, 2];
+    H.quiver_x2_nominal   = quiver(0,0, 0, 0, 1.0, 'k--', 'DisplayName', 'x_2 nominal');
+    H.quiver_x2_reference = quiver(0,0, 0, 0, 1.0, 'k', 'DisplayName', 'x_2 reference');
+    H.feasible_set        = half_plane([], zeros(1, 2), 0, [0; 0], H.fig2_axis_range, 'r', 'feasible set');
+
+    figure(3);
+    hold on; grid on; box on;
+    xlabel('t sec');
+    ylabel('|v| m/s');
+    set(gcf, 'position', [100, 600, 800, 400], 'color', 'w');
+    set(gca, 'fontsize', 16, 'XAxisLocation', 'origin', 'YAxisLocation', 'origin');
+    xlim([0, sim.duration]);
+    H.fig3_x2_reference_norm = animatedline('Color', 'k');
+else
+    H.vtol = vtol_show(x_vtol, y_vtol, z_vtol, theta, pitch, yaw, H.vtol);
+    addpoints(H.vtol_traj, z_vtol, x_vtol, y_vtol);
+
+    H.quiver_x2_nominal.UData   = ctrl.x2_nominal(1);
+    H.quiver_x2_nominal.VData   = ctrl.x2_nominal(2);
+    H.quiver_x2_reference.UData = ctrl.x2_ref(1);
+    H.quiver_x2_reference.VData = ctrl.x2_ref(2);
+    H.quiver_x2_state.UData     = x_info.v_x;
+    H.quiver_x2_state.VData     = x_info.v_y;
+    H.feasible_set = half_plane(H.feasible_set, ctrl.A_L, ctrl.b_L, [0; 0]);
+
+    addpoints(H.fig3_x2_reference_norm, sim.t, norm(ctrl.x2_ref));
+end
+end
+
+function H = graphic2(H, x_info, ctrl, sim)
+x_vtol = x_info.p_x;
+y_vtol = x_info.p_y;
+z_vtol = 0;
+theta  = x_info.theta;
+pitch  = min(max(ctrl.u1*cos(theta) - x_info.g, -pi/100), pi/100);
+yaw    = 0;
+if(isempty(H))
+    figure(1);
+    H.vtol      = vtol_show(x_vtol, y_vtol, z_vtol, theta, pitch, yaw, []);
+    H.vtol_traj = animatedline('Color', 'b', 'DisplayName', 'Other Controller', 'LineWidth', 2.0, 'LineStyle', ':');
+
+    figure(2);
+    H.fig2_axis_range     = [-2, 2, -2, 2];
+    H.quiver_x2_nominal   = quiver(0,0, 0, 0, 1.0, 'b--', 'DisplayName', 'x_2 nominal');
+    H.quiver_x2_reference = quiver(0,0, 0, 0, 1.0, 'b', 'DisplayName', 'x_2 reference');
+    H.feasible_set        = half_plane([], zeros(1, 2), 0, [0; 0], H.fig2_axis_range, 'c', 'feasible set');
+
+    figure(3);
+    H.fig3_x2_reference_norm = animatedline('Color', 'b', 'LineWidth', 2.0, 'LineStyle', ':');
+
+else
+    H.vtol = vtol_show(x_vtol, y_vtol, z_vtol, theta, pitch, yaw, H.vtol);
+    addpoints(H.vtol_traj, z_vtol, x_vtol, y_vtol);
+
+    H.quiver_x2_nominal.UData   = ctrl.x2_nominal(1);
+    H.quiver_x2_nominal.VData   = ctrl.x2_nominal(2);
+    H.quiver_x2_reference.UData = ctrl.x2_ref(1);
+    H.quiver_x2_reference.VData = ctrl.x2_ref(2);
+    H.quiver_x2_state.UData     = x_info.v_x;
+    H.quiver_x2_state.VData     = x_info.v_y;
+    H.feasible_set = half_plane(H.feasible_set, ctrl.A_L, ctrl.b_L, [0; 0]);
+
+    addpoints(H.fig3_x2_reference_norm, sim.t, norm(ctrl.x2_ref));
+end
+end
+
+
+function H = vtol_show(x_vtol, y_vtol, z_vtol, theta, pitch, yaw, H)
+c1 = cos(theta); c2 = cos(pitch); c3 = cos(yaw);
+s1 = sin(theta); s2 = sin(pitch); s3 = sin(yaw);
+R_z = [c3, -s3,  0; s3, c3,   0;   0,  0,  1];
+R_y = [c2,   0, s2;  0,  1,   0; -s2,  0, c2];
+R_x = [ 1,   0,  0;  0, c1, -s1;   0, s1, c1];
+R = (R_x*R_y*R_z)';
+p = [z_vtol, x_vtol, y_vtol];
+
+if(isempty(H))
+    H.vertices = [ 0.2205	 0.2055	0.1865	0.1305	0.1125	0.1175	0.1725	0.1855	0.1715	0.1135	0.00650	-0.1255	-0.1145	-0.0955	-0.0715	-0.0925	-0.2225	-0.2225	-0.0925	-0.0715	-0.0955	-0.1145	-0.1255	0.00650	0.1135	0.1715	0.1855	0.1725	0.1175	0.1125	0.1305	0.1865	0.2055	0.2205	0.2205	0.2055	0.1865	0.1305	0.1125	0.1175	0.1725	0.1855	0.1715	0.1135	0.00650	-0.1255	-0.1145	-0.0955	-0.0715	-0.0925	-0.2225	-0.2225	-0.0925	-0.0715	-0.0955	-0.1145	-0.1255	0.00650	0.1135	0.1715	0.1855	0.1725	0.1175	0.1125	0.1305	0.1865	0.2055	0.2205;
+                      0	-0.0370	-0.0430	-0.0630	-0.0890	-0.109	-0.110	-0.128	-0.146	-0.146	-0.317	-0.349	-0.317	-0.260	-0.0830	-0.0240	0	0	0.0240	0.0830	0.260	0.317	0.349	0.317	0.146	0.146	0.128	0.110	0.109	0.0890	0.0630	0.0430	0.0370	0	0	-0.0370	-0.0430	-0.0630	-0.0890	-0.109	-0.110	-0.128	-0.146	-0.146	-0.317	-0.349	-0.317	-0.260	-0.0830	-0.0240	0	0	0.0240	0.0830	0.260	0.317	0.349	0.317	0.146	0.146	0.128	0.110	0.109	0.0890	0.0630	0.0430	0.0370	0;
+                 -0.0443	-0.0428	-0.0409	-0.0353	-0.0335	-0.0340	-0.0395	-0.0408	-0.0394	-0.0336	-0.0229	-0.00970	-0.0108	-0.0127	-0.0151	-0.0130	0	0	-0.0130	-0.0151	-0.0127	-0.0108	-0.00970	-0.0229	-0.0336	-0.0394	-0.0408	-0.0395	-0.0340	-0.0335	-0.0353	-0.0409	-0.0428	-0.0443	-0.0886	-0.0856	-0.0818	-0.0706	-0.0670	-0.0680	-0.0790	-0.0816	-0.0788	-0.0672	-0.0458	-0.0194	-0.0216	-0.0254	-0.0302	-0.0260	0	0	-0.0260	-0.0302	-0.0254	-0.0216	-0.0194	-0.0458	-0.0672	-0.0788	-0.0816	-0.0790	-0.0680	-0.0670	-0.0706	-0.0818	-0.0856	-0.0886]';
+    H.cnt = size(H.vertices, 1);
+    H.cnt_half = H.cnt / 2;
+    H.face_index1 = [1:H.cnt_half; (H.cnt_half+1):H.cnt];
+    H.face_index2 = mod((1:H.cnt_half)'+[0, 1, 1, 0]-1, H.cnt_half) + 1 + [0,0,H.cnt_half,H.cnt_half];
+    rotated_vertices = H.vertices*R + p;
+    H.handle_surface1 = patch('Faces', H.face_index1, 'Vertices', rotated_vertices, 'FaceColor', 'c', 'handlevisibility', 'off');
+    H.handle_surface2 = patch('Faces', H.face_index2, 'Vertices', rotated_vertices, 'FaceColor', 'c', 'handlevisibility', 'off');
+
+    radius = 100 / 1000;
+    motor_angle_bias = -pi/20;
+    H.circle = (radius*[cos(motor_angle_bias), 0, -sin(motor_angle_bias); 0, 1, 0; sin(motor_angle_bias), 0, cos(motor_angle_bias)]*[cos(linspace(0, 2*pi, 20)); sin(linspace(0, 2*pi, 20)); zeros(1, 20)])';
+    H.motor_position = H.vertices([8, 17, 27], :) + [zeros(3,1), [0.045; 0; 0], zeros(3,1)]';
+
+    motor = (H.circle + H.motor_position(1, :))*R + p;
+    H.handle_motor1 = patch(motor(:, 1), motor(:, 2), motor(:, 3), 'k-', 'linewidth', 2, 'handlevisibility', 'off', 'FaceAlpha', 0.2);
+    motor = (H.circle + H.motor_position(2, :))*R + p;
+    H.handle_motor2 = patch(motor(:, 1), motor(:, 2), motor(:, 3), 'k-', 'linewidth', 2, 'handlevisibility', 'off', 'FaceAlpha', 0.2);
+    motor = (H.circle + H.motor_position(3, :))*R + p;
+    H.handle_motor3 = patch(motor(:, 1), motor(:, 2), motor(:, 3), 'k-', 'linewidth', 2, 'handlevisibility', 'off', 'FaceAlpha', 0.2);
+else
+    rotated_vertices  = H.vertices*R + p;
+    H.handle_surface1.Vertices = rotated_vertices;
+    H.handle_surface2.Vertices = rotated_vertices;
+
+    motor = (H.circle + H.motor_position(1, :))*R + p;
+    H.handle_motor1.XData = motor(:, 1);
+    H.handle_motor1.YData = motor(:, 2);
+    H.handle_motor1.ZData = motor(:, 3);
+
+    motor = (H.circle + H.motor_position(2, :))*R + p;
+    H.handle_motor2.XData = motor(:, 1);
+    H.handle_motor2.YData = motor(:, 2);
+    H.handle_motor2.ZData = motor(:, 3);
+
+    motor = (H.circle + H.motor_position(3, :))*R + p;
+    H.handle_motor3.XData = motor(:, 1);
+    H.handle_motor3.YData = motor(:, 2);
+    H.handle_motor3.ZData = motor(:, 3);
+end
+end
+
+function H = obstacle_show_2D(H, obs_cell, r, clr, layer, facealpha)
+if(~isempty(H) && isequal(obs_cell, H.obs_cell))
+    return;
+end
+
+for i = 1:size(obs_cell, 2)
+    obs = obs_cell{i};
+    angle          = zeros(1, size(obs,2));
+    angle(1:end-1) = atan2(obs(2, 2:end)-obs(2, 1:end-1), obs(1, 2:end)-obs(1, 1:end-1));
+    angle(end)     = angle(1);
+    angle = angle+pi/2;
+    angle = atan2(sin(angle), cos(angle));
+
+    item_cnt = 20;
+    line_pos = zeros(2, item_cnt*4);
+    line_pos_record = zeros(2, item_cnt*4*(size(obs, 2)-1));
+    for j = 1:size(obs, 2)-1
+        line_pos(:, 1) = obs(:,j) + r(i)*[cos(angle(j)); sin(angle(j))];
+        line_pos(:, item_cnt*0+(1:item_cnt)) = line_pos(:, 1) + [linspace(0, obs(1, j+1)-obs(1, j), item_cnt); linspace(0, obs(2, j+1)-obs(2, j), item_cnt)];
+        angle_segments = linspace(angle(j), angle(j)-pi, item_cnt);
+        line_pos(:, item_cnt*1+(1:item_cnt)) = obs(:, j+1) + r(i)*[cos(angle_segments); sin(angle_segments)];
+        line_pos(:, item_cnt*2+(1:item_cnt)) = line_pos(:, item_cnt*2) + [linspace(0, obs(1, j)-obs(1, j+1), item_cnt); linspace(0, obs(2, j)-obs(2, j+1), item_cnt)];
+        angle_segments = linspace(angle(j)+pi, angle(j), item_cnt);
+        line_pos(:, item_cnt*3+(1:item_cnt)) = obs(:, j) + r(i)*[cos(angle_segments); sin(angle_segments)];
+        line_pos_record(:, (j-1)*item_cnt*4 + (1:item_cnt*4)) = line_pos;
+
+        H.handle_patch{i}.patch(j) = patch(layer*ones(1, size(line_pos,2)), line_pos(1, :), line_pos(2, :), clr, 'handlevisibility', 'off', 'linestyle', 'none', 'facealpha', facealpha);
+    end
+end
+
+end
+
+function  res = limit(res, lower, upper)
+res = min(max(res, lower), upper);
+end
+
+function H = obstacle_show_2D_hatchfill(H, obs_cell, r, clr, layer, facealpha)
+if(~isempty(H) && isequal(obs_cell, H.obs_cell))
+    return;
+end
+
+for i = 1:size(obs_cell, 2)
+    obs = obs_cell{i};
+    angle          = zeros(1, size(obs,2));
+    angle(1:end-1) = atan2(obs(2, 2:end)-obs(2, 1:end-1), obs(1, 2:end)-obs(1, 1:end-1));
+    angle(end)     = angle(1);
+    angle = angle+pi/2;
+    angle = atan2(sin(angle), cos(angle));
+
+    item_cnt = 20;
+    line_pos = zeros(2, item_cnt*4);
+    line_pos_record = zeros(2, item_cnt*4*(size(obs, 2)-1));
+    for j = 1:size(obs, 2)-1
+        line_pos(:, 1) = obs(:,j) + r(i)*[cos(angle(j)); sin(angle(j))];
+        line_pos(:, item_cnt*0+(1:item_cnt)) = line_pos(:, 1) + [linspace(0, obs(1, j+1)-obs(1, j), item_cnt); linspace(0, obs(2, j+1)-obs(2, j), item_cnt)];
+        angle_segments = linspace(angle(j), angle(j)-pi, item_cnt);
+        line_pos(:, item_cnt*1+(1:item_cnt)) = obs(:, j+1) + r(i)*[cos(angle_segments); sin(angle_segments)];
+        line_pos(:, item_cnt*2+(1:item_cnt)) = line_pos(:, item_cnt*2) + [linspace(0, obs(1, j)-obs(1, j+1), item_cnt); linspace(0, obs(2, j)-obs(2, j+1), item_cnt)];
+        angle_segments = linspace(angle(j)+pi, angle(j), item_cnt);
+        line_pos(:, item_cnt*3+(1:item_cnt)) = obs(:, j) + r(i)*[cos(angle_segments); sin(angle_segments)];
+        line_pos_record(:, (j-1)*item_cnt*4 + (1:item_cnt*4)) = line_pos;
+
+        H.handle_patch{i}.patch(j) = patch(layer*ones(1, size(line_pos,2)), line_pos(1, :), line_pos(2, :), 'w', 'handlevisibility', 'off', 'linestyle', 'none', 'facealpha', 1.0);
+        H.handle_patch{i}.patch(j) = patch(line_pos(1, :), line_pos(2, :), clr, 'handlevisibility', 'off', 'linestyle', 'none', 'facealpha', facealpha);
+        H.handle_patch{i}.hacthfill(j) = hatchfill(H.handle_patch{i}.patch(j), 'single', 45, 5, [1.0, 1.0, 1.0]);
+        H.handle_patch{i}.hacthfill(j).HandleVisibility = 'off';
+        H.handle_patch{i}.hacthfill(j).ZData = H.handle_patch{i}.hacthfill(j).YData;
+        H.handle_patch{i}.hacthfill(j).YData = H.handle_patch{i}.hacthfill(j).XData;
+        H.handle_patch{i}.hacthfill(j).XData = layer*ones(1, size(H.handle_patch{i}.hacthfill(j).YData, 2));
+    end
+    H.handle_line(i)  = plot3(layer*ones(1, size(line_pos, 2)), line_pos(1, :), line_pos(2, :), 'k', 'linewidth', 0.5, 'marker', 'none', 'linestyle', '-', 'HandleVisibility', 'off');
+end
+
+end
